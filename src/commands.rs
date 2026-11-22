@@ -544,14 +544,19 @@ mod tests {
             false,
             Some(&"1".repeat(32)),
             &candidate,
-            &[r.clone()]
+            std::slice::from_ref(&r)
         ));
-        assert!(may_overlap(true, None, &candidate, &[r.clone()]));
+        assert!(may_overlap(
+            true,
+            None,
+            &candidate,
+            std::slice::from_ref(&r)
+        ));
         assert!(may_overlap(
             false,
             Some(&"0".repeat(32)),
             &candidate,
-            &[r.clone()]
+            std::slice::from_ref(&r)
         ));
         let mut global = r;
         global.name = GLOBAL.into();

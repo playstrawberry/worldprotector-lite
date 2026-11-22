@@ -39,17 +39,18 @@ mod tests {
     use super::*;
     use crate::regions::{Bounds, Flag, Region, Verdict};
     fn scratch() -> std::path::PathBuf {
-        let dir = std::path::PathBuf::from(
-            std::env::var_os("CARGO_TARGET_DIR").expect("set CARGO_TARGET_DIR for storage tests"),
-        )
-        .join(format!(
-            "worldprotector-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
+        // The build's own folder when it names one; any machine's temporary folder otherwise.
+        let dir = std::env::var_os("CARGO_TARGET_DIR")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "worldprotector-test-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

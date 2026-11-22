@@ -3,14 +3,21 @@
 use crate::regions::{self, Bounds, Flag, MAX_SELECTIONS, Policy, Verdict};
 use crate::{BYPASS, Shared, WAND, holds_wand, player_id, tell};
 use std::sync::Arc;
+use strawberry_plugin_api::events::extension::{
+    BLOCK_DESTROY, ExtensionEvent, ExtensionEventHandler,
+};
 use strawberry_plugin_api::events::*;
 use strawberry_plugin_api::events_wit::*;
 use strawberry_plugin_api::wit::strawberry::plugin::common::BlockPos;
-use strawberry_plugin_api::{Context, Player, Result, Server, World};
+use strawberry_plugin_api::{BuildAction, Context, Player, Result, Server, World};
 
 /// The wand's two clicks, beside the nine flags in [`crate::Shared::activate`]'s mask.
 pub const WAND_BIT: u16 = 1 << 9;
 const INTERACT_EVENT_BIT: u16 = 1 << 10;
+/// The build check other plugins ask (`player.can_build`), beside the place, break and use flags.
+const BUILD_CHECK_BIT: u16 = 1 << 11;
+/// The block the world destroys with no player behind it ("block-destroy"), beside the break flag.
+const DESTROY_EVENT_BIT: u16 = 1 << 12;
 /// A target is never further from the player than this; the server checks the reach itself.
 const REACH: i32 = 16;
 
@@ -68,7 +75,43 @@ pub fn subscribe(context: &Context, shared: &Arc<Shared>, missing: u16, done: u1
         )?;
         added |= INTERACT_EVENT_BIT;
     }
+    // A block the world destroys (a plant that pops, a fluid that replaces it) is a break with no
+    // player: the break flag rules on it through the block-destroy event, not the block break one.
+    if (missing | done) & Flag::Break.bit() != 0 && done & DESTROY_EVENT_BIT == 0 {
+        context.register_extension_event_handler(
+            BLOCK_DESTROY,
+            Guard(shared.clone()),
+            options(),
+        )?;
+        added |= DESTROY_EVENT_BIT;
+    }
+    // Things other plugins put into the world (furniture, its barriers and light) ask the same
+    // build, break and interact rules through the server's build check.
+    let checked = Flag::Build.bit() | Flag::Break.bit() | Flag::Interact.bit();
+    if (missing | done) & checked != 0 && done & BUILD_CHECK_BIT == 0 {
+        let guard = Guard(shared.clone());
+        context.register_build_check_handler(options().priority, move |_server, check| {
+            let pos = coords(check.event.pos);
+            !guard.at(
+                &check.event.world.get_name(),
+                pos,
+                check_flag(check.event.action),
+                Some(&check.player),
+            )
+        })?;
+        added |= BUILD_CHECK_BIT;
+    }
     Ok(done | added)
+}
+
+/// The flag a build check asks: the one the block place, block break and block or entity use
+/// handlers ask for the same action.
+pub const fn check_flag(action: BuildAction) -> Flag {
+    match action {
+        BuildAction::Place => Flag::Build,
+        BuildAction::Break => Flag::Break,
+        BuildAction::Use => Flag::Interact,
+    }
 }
 
 fn coords(p: BlockPos) -> [i32; 3] {
@@ -116,8 +159,15 @@ impl Guard {
             Verdict::Unavailable => true,
         }
     }
+    /// The decision of every block handler and of the build check: whether `flag` is refused at
+    /// `pos` for `p`. It only answers; `player_at` adds the refusal line for an event.
     fn at(&self, world: &str, pos: [i32; 3], flag: Flag, p: Option<&Player>) -> bool {
         self.refuses(world, p, |policy, id| policy.decide(world, pos, flag, id))
+    }
+    /// Whether the world may destroy the block at `pos` with no player behind it: the break flag
+    /// with no player (a protected cuboid keeps its plants, and no fluid replaces its blocks).
+    fn destroy_refused(&self, world: &str, pos: [i32; 3]) -> bool {
+        self.at(world, pos, Flag::Break, None)
     }
     fn player_at(&self, world: &str, pos: [i32; 3], flag: Flag, p: &Player) -> bool {
         let refused = self.at(world, pos, flag, Some(p));
@@ -261,11 +311,24 @@ impl EventHandler<PlayerLeaveEvent> for Guard {
 impl EventHandler<BlockBreakEvent> for Guard {
     fn handle(&self, _s: Server, mut e: BlockBreakEventData) -> BlockBreakEventData {
         if let Some(p) = e.player.as_ref() {
-            e.cancelled |= self.player_at(&world_of(p), coords(e.block_pos), Flag::Break, p);
+            let flag = check_flag(BuildAction::Break);
+            e.cancelled |= self.player_at(&world_of(p), coords(e.block_pos), flag, p);
         } else if let Some(world) = event_world() {
-            e.cancelled |= self.at(&world.get_name(), coords(e.block_pos), Flag::Break, None);
+            e.cancelled |= self.destroy_refused(&world.get_name(), coords(e.block_pos));
         }
         e
+    }
+}
+impl ExtensionEventHandler for Guard {
+    /// The world destroys a block with no player behind it ("block-destroy"). Fails closed: an
+    /// event that cannot be read is refused.
+    fn handle(&self, _s: Server, event: &ExtensionEvent) {
+        let refused = event
+            .block_destroy()
+            .is_none_or(|d| self.destroy_refused(&d.world.get_name(), coords(d.pos)));
+        if refused {
+            event.set_cancelled(true);
+        }
     }
 }
 impl EventHandler<BlockDamageEvent> for Guard {
@@ -285,7 +348,7 @@ impl EventHandler<BlockPlaceEvent> for Guard {
         e.cancelled |= self.player_at(
             &world_of(&e.player),
             coords(e.block_pos),
-            Flag::Build,
+            check_flag(BuildAction::Place),
             &e.player,
         );
         e
@@ -335,7 +398,8 @@ impl EventHandler<PlayerInteractEvent> for Guard {
             }
             return e;
         }
-        e.cancelled |= self.player_at(&world_of(&e.player), pos, Flag::Interact, &e.player);
+        let flag = check_flag(BuildAction::Use);
+        e.cancelled |= self.player_at(&world_of(&e.player), pos, flag, &e.player);
         e
     }
 }
@@ -508,5 +572,74 @@ impl EventHandler<PlayerBucketFillEvent> for Guard {
             &e.player,
         );
         e
+    }
+}
+
+#[cfg(test)]
+mod build_check_tests {
+    use super::*;
+    use crate::regions::Region;
+
+    #[test]
+    fn a_build_check_asks_the_flag_its_block_event_asks() {
+        assert_eq!(check_flag(BuildAction::Place), Flag::Build);
+        assert_eq!(check_flag(BuildAction::Break), Flag::Break);
+        assert_eq!(check_flag(BuildAction::Use), Flag::Interact);
+    }
+
+    #[test]
+    fn a_protected_cuboid_refuses_a_block_destroy_as_a_break_with_no_player() {
+        let region = Region::new(
+            "spawn",
+            "world",
+            Bounds {
+                min: [0, 60, 0],
+                max: [10, 80, 10],
+            },
+            Some("00000000000000000000000000000001".into()),
+        );
+        let policy = Policy::build(vec![region]).unwrap();
+        let guard = Guard(Shared::new(Some(policy), std::path::PathBuf::new()));
+        // Inside, the break flag refuses the world's destroy: the plant stays, the block stays.
+        assert!(guard.destroy_refused("world", [5, 70, 5]));
+        // It is the very question the block break handler asks of a break with no player.
+        assert_eq!(
+            guard.destroy_refused("world", [5, 70, 5]),
+            guard.at("world", [5, 70, 5], Flag::Break, None)
+        );
+        // Outside, or in another world: allowed.
+        assert!(!guard.destroy_refused("world", [50, 70, 5]));
+        assert!(!guard.destroy_refused("nether", [5, 70, 5]));
+    }
+
+    #[test]
+    fn a_protected_cuboid_refuses_the_check_as_it_refuses_the_event() {
+        let region = Region::new(
+            "spawn",
+            "world",
+            Bounds {
+                min: [0, 60, 0],
+                max: [10, 80, 10],
+            },
+            Some("00000000000000000000000000000001".into()),
+        );
+        let policy = Policy::build(vec![region]).unwrap();
+        let guard = Guard(Shared::new(Some(policy), std::path::PathBuf::new()));
+        for action in [BuildAction::Place, BuildAction::Break, BuildAction::Use] {
+            // Inside: refused without a player who may (no identity, no bypass).
+            assert!(
+                guard.at("world", [5, 70, 5], check_flag(action), None),
+                "{action:?}"
+            );
+            // Outside, or in another world: allowed.
+            assert!(
+                !guard.at("world", [50, 70, 5], check_flag(action), None),
+                "{action:?}"
+            );
+            assert!(
+                !guard.at("nether", [5, 70, 5], check_flag(action), None),
+                "{action:?}"
+            );
+        }
     }
 }
